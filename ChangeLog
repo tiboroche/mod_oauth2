@@ -1,3 +1,8 @@
+01/06/2026
+- leverage HTTP status code from oauth2_token_verify
+- depend on liboauth2 >= 2.2.0
+- release 4.1.0
+
 08/22/2024
 - change LICENSE to Apache 2.0
 - depend on liboauth2 >= 2.0.0

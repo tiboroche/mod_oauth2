@@ -93,6 +93,7 @@ static int oauth2_request_handler(oauth2_cfg_source_token_t *cfg,
 	int rv = DECLINED;
 	json_t *json_token = NULL;
 	char *source_token = NULL;
+	oauth2_http_status_code_t status_code = 0;
 
 	oauth2_debug(ctx->log, "enter");
 
@@ -112,10 +113,14 @@ static int oauth2_request_handler(oauth2_cfg_source_token_t *cfg,
 	}
 
 	if (oauth2_token_verify(ctx->log, ctx->request, verify, source_token,
-				&json_token) == false) {
-		rv = oauth2_apache_return_www_authenticate(
-		    cfg, ctx, HTTP_UNAUTHORIZED, OAUTH2_ERROR_INVALID_TOKEN,
-		    "Token could not be verified.");
+				&json_token, &status_code) == false) {
+		if ((status_code >= 400) && (status_code < 500)) {
+			rv = oauth2_apache_return_www_authenticate(
+			    cfg, ctx, status_code, OAUTH2_ERROR_INVALID_TOKEN,
+			    "Token could not be verified.");
+		} else {
+			rv = status_code;
+		}
 		goto end;
 	}
 
