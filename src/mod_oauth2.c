@@ -43,6 +43,7 @@ typedef struct oauth2_cfg_dir_t {
 	oauth2_cfg_source_token_t *source_token;
 	oauth2_cfg_token_verify_t *verify;
 	oauth2_cfg_target_pass_t *target_pass;
+	oauth2_flag_t do_not_overwrite_www_authenticate;
 } oauth2_cfg_dir_t;
 
 static apr_status_t oauth2_cfg_dir_cleanup(void *data)
@@ -62,6 +63,7 @@ static void *oauth2_cfg_dir_create(apr_pool_t *pool, char *path)
 	cfg->source_token = oauth2_cfg_source_token_init(NULL);
 	cfg->verify = NULL;
 	cfg->target_pass = oauth2_cfg_target_pass_init(NULL);
+	cfg->do_not_overwrite_www_authenticate = OAUTH2_CFG_FLAG_UNSET;
 	apr_pool_cleanup_register(pool, cfg, oauth2_cfg_dir_cleanup,
 				  oauth2_cfg_dir_cleanup);
 	return cfg;
@@ -79,16 +81,29 @@ static void *oauth2_cfg_dir_merge(apr_pool_t *pool, void *b, void *a)
 			  : oauth2_cfg_token_verify_clone(NULL, base->verify);
 	oauth2_cfg_target_pass_merge(NULL, cfg->target_pass, base->target_pass,
 				     add->target_pass);
+	cfg->do_not_overwrite_www_authenticate =
+	    add->do_not_overwrite_www_authenticate != OAUTH2_CFG_FLAG_UNSET
+		? add->do_not_overwrite_www_authenticate
+		: base->do_not_overwrite_www_authenticate;
 	return cfg;
 }
 
 #define OAUTH2_REQUEST_STATE_KEY_CLAIMS "C"
 
+static bool oauth2_www_authenticate_is_set(oauth2_apache_request_ctx_t *ctx)
+{
+	return apr_table_get(ctx->r->err_headers_out,
+			     OAUTH2_HTTP_HDR_WWW_AUTHENTICATE) != NULL ||
+	       apr_table_get(ctx->r->headers_out,
+			     OAUTH2_HTTP_HDR_WWW_AUTHENTICATE) != NULL;
+}
+
 static int oauth2_request_handler(oauth2_cfg_source_token_t *cfg,
 				  oauth2_cfg_token_verify_t *verify,
 				  oauth2_cfg_target_pass_t *target_pass,
 				  oauth2_apache_request_ctx_t *ctx,
-				  bool error_if_no_token_found)
+				  bool error_if_no_token_found,
+				  oauth2_flag_t do_not_overwrite_www_auth)
 {
 	int rv = DECLINED;
 	json_t *json_token = NULL;
@@ -104,10 +119,14 @@ static int oauth2_request_handler(oauth2_cfg_source_token_t *cfg,
 	    ctx->r);
 	if (source_token == NULL) {
 		if (error_if_no_token_found) {
-			rv = oauth2_apache_return_www_authenticate(
-			    cfg, ctx, HTTP_UNAUTHORIZED,
-			    OAUTH2_ERROR_INVALID_REQUEST,
-			    "No bearer token found in the request.");
+			if (do_not_overwrite_www_auth == true &&
+			    oauth2_www_authenticate_is_set(ctx))
+				rv = HTTP_UNAUTHORIZED;
+			else
+				rv = oauth2_apache_return_www_authenticate(
+				    cfg, ctx, HTTP_UNAUTHORIZED,
+				    OAUTH2_ERROR_INVALID_REQUEST,
+				    "No bearer token found in the request.");
 		}
 		goto end;
 	}
@@ -115,9 +134,14 @@ static int oauth2_request_handler(oauth2_cfg_source_token_t *cfg,
 	if (oauth2_token_verify(ctx->log, ctx->request, verify, source_token,
 				&json_token, &status_code) == false) {
 		if ((status_code >= 400) && (status_code < 500)) {
-			rv = oauth2_apache_return_www_authenticate(
-			    cfg, ctx, status_code, OAUTH2_ERROR_INVALID_TOKEN,
-			    "Token could not be verified.");
+			if (do_not_overwrite_www_auth == true &&
+			    oauth2_www_authenticate_is_set(ctx))
+				rv = status_code;
+			else
+				rv = oauth2_apache_return_www_authenticate(
+				    cfg, ctx, status_code,
+				    OAUTH2_ERROR_INVALID_TOKEN,
+				    "Token could not be verified.");
 		} else {
 			rv = status_code;
 		}
@@ -126,9 +150,14 @@ static int oauth2_request_handler(oauth2_cfg_source_token_t *cfg,
 
 	if (oauth2_apache_set_request_user(target_pass, ctx, json_token) ==
 	    false) {
-		rv = oauth2_apache_return_www_authenticate(
-		    cfg, ctx, HTTP_UNAUTHORIZED, OAUTH2_ERROR_INVALID_TOKEN,
-		    "Could not determine remote user.");
+		if (do_not_overwrite_www_auth == true &&
+		    oauth2_www_authenticate_is_set(ctx))
+			rv = HTTP_UNAUTHORIZED;
+		else
+			rv = oauth2_apache_return_www_authenticate(
+			    cfg, ctx, HTTP_UNAUTHORIZED,
+			    OAUTH2_ERROR_INVALID_TOKEN,
+			    "Could not determine remote user.");
 		goto end;
 	}
 
@@ -185,13 +214,15 @@ static int oauth2_check_user_id_handler(request_rec *r)
 		     r->parsed_uri.path, r->args, ap_is_initial_req(r));
 
 	if (strcasecmp((const char *)ap_auth_type(r), OAUTH2_AUTH_TYPE) == 0)
-		return oauth2_request_handler(cfg->source_token, cfg->verify,
-					      cfg->target_pass, ctx, true);
+		return oauth2_request_handler(
+		    cfg->source_token, cfg->verify, cfg->target_pass, ctx,
+		    true, cfg->do_not_overwrite_www_authenticate);
 
 	if (strcasecmp((const char *)ap_auth_type(r),
 		       OAUTH2_AUTH_TYPE_OPENIDC) == 0)
-		return oauth2_request_handler(cfg->source_token, cfg->verify,
-					      cfg->target_pass, ctx, false);
+		return oauth2_request_handler(
+		    cfg->source_token, cfg->verify, cfg->target_pass, ctx,
+		    false, cfg->do_not_overwrite_www_authenticate);
 
 	return DECLINED;
 }
@@ -298,6 +329,15 @@ OAUTH2_APACHE_CMD_ARGS2(oauth2, oauth2_cfg_dir_t, accept_token_in,
 OAUTH2_APACHE_CMD_ARGS1(oauth2, oauth2_cfg_dir_t, target_pass,
 			oauth2_cfg_set_target_pass_options, cfg->target_pass)
 
+static const char *apache_oauth2_set_do_not_overwrite_www_authenticate(
+    cmd_parms *cmd, void *m, const char *v1)
+{
+	oauth2_cfg_dir_t *cfg = (oauth2_cfg_dir_t *)m;
+	return oauth2_cfg_set_flag_slot(
+	    cfg,
+	    offsetof(oauth2_cfg_dir_t, do_not_overwrite_www_authenticate), v1);
+}
+
 // clang-format off
 
 static const command_rec OAUTH2_APACHE_COMMANDS(oauth2)[] = {
@@ -326,6 +366,11 @@ static const command_rec OAUTH2_APACHE_COMMANDS(oauth2)[] = {
 		"OAuth2Cache",
 		cache,
 		"Set cache backend and options."),
+
+	OAUTH2_APACHE_CMD_ARGS(oauth2, 1,
+		"OAuth2DoNotOverwriteWWWAuthenticate",
+		do_not_overwrite_www_authenticate,
+		"Do not overwrite an existing WWW-Authenticate header on error responses (default: Off)."),
 
 	{ NULL }
 };
