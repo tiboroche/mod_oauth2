@@ -43,6 +43,7 @@ typedef struct oauth2_cfg_dir_t {
 	oauth2_cfg_source_token_t *source_token;
 	oauth2_cfg_token_verify_t *verify;
 	oauth2_cfg_target_pass_t *target_pass;
+	char *www_authenticate_header_string;
 } oauth2_cfg_dir_t;
 
 static apr_status_t oauth2_cfg_dir_cleanup(void *data)
@@ -52,6 +53,7 @@ static apr_status_t oauth2_cfg_dir_cleanup(void *data)
 	if (cfg->verify)
 		oauth2_cfg_token_verify_free(NULL, cfg->verify);
 	oauth2_cfg_target_pass_free(NULL, cfg->target_pass);
+	oauth2_mem_free(cfg->www_authenticate_header_string);
 	oauth2_mem_free(cfg);
 	return APR_SUCCESS;
 }
@@ -62,6 +64,7 @@ static void *oauth2_cfg_dir_create(apr_pool_t *pool, char *path)
 	cfg->source_token = oauth2_cfg_source_token_init(NULL);
 	cfg->verify = NULL;
 	cfg->target_pass = oauth2_cfg_target_pass_init(NULL);
+	cfg->www_authenticate_header_string = NULL;
 	apr_pool_cleanup_register(pool, cfg, oauth2_cfg_dir_cleanup,
 				  oauth2_cfg_dir_cleanup);
 	return cfg;
@@ -79,14 +82,37 @@ static void *oauth2_cfg_dir_merge(apr_pool_t *pool, void *b, void *a)
 			  : oauth2_cfg_token_verify_clone(NULL, base->verify);
 	oauth2_cfg_target_pass_merge(NULL, cfg->target_pass, base->target_pass,
 				     add->target_pass);
+	cfg->www_authenticate_header_string =
+	    add->www_authenticate_header_string != NULL
+		? oauth2_strdup(add->www_authenticate_header_string)
+		: (base->www_authenticate_header_string != NULL
+		       ? oauth2_strdup(base->www_authenticate_header_string)
+		       : NULL);
 	return cfg;
 }
 
 #define OAUTH2_REQUEST_STATE_KEY_CLAIMS "C"
 
+static int
+oauth2_set_www_authenticate(const char *www_authenticate_header_string,
+			    oauth2_cfg_source_token_t *cfg,
+			    oauth2_apache_request_ctx_t *ctx, int status_code,
+			    const char *error, const char *error_description)
+{
+	if (www_authenticate_header_string != NULL) {
+		apr_table_add(ctx->r->err_headers_out,
+			      OAUTH2_HTTP_HDR_WWW_AUTHENTICATE,
+			      www_authenticate_header_string);
+		return status_code;
+	}
+	return oauth2_apache_return_www_authenticate(cfg, ctx, status_code,
+						     error, error_description);
+}
+
 static int oauth2_request_handler(oauth2_cfg_source_token_t *cfg,
 				  oauth2_cfg_token_verify_t *verify,
 				  oauth2_cfg_target_pass_t *target_pass,
+				  const char *www_authenticate_header_string,
 				  oauth2_apache_request_ctx_t *ctx,
 				  bool error_if_no_token_found)
 {
@@ -104,9 +130,9 @@ static int oauth2_request_handler(oauth2_cfg_source_token_t *cfg,
 	    ctx->r);
 	if (source_token == NULL) {
 		if (error_if_no_token_found) {
-			rv = oauth2_apache_return_www_authenticate(
-			    cfg, ctx, HTTP_UNAUTHORIZED,
-			    OAUTH2_ERROR_INVALID_REQUEST,
+			rv = oauth2_set_www_authenticate(
+			    www_authenticate_header_string, cfg, ctx,
+			    HTTP_UNAUTHORIZED, OAUTH2_ERROR_INVALID_REQUEST,
 			    "No bearer token found in the request.");
 		}
 		goto end;
@@ -115,8 +141,9 @@ static int oauth2_request_handler(oauth2_cfg_source_token_t *cfg,
 	if (oauth2_token_verify(ctx->log, ctx->request, verify, source_token,
 				&json_token, &status_code) == false) {
 		if ((status_code >= 400) && (status_code < 500)) {
-			rv = oauth2_apache_return_www_authenticate(
-			    cfg, ctx, status_code, OAUTH2_ERROR_INVALID_TOKEN,
+			rv = oauth2_set_www_authenticate(
+			    www_authenticate_header_string, cfg, ctx,
+			    status_code, OAUTH2_ERROR_INVALID_TOKEN,
 			    "Token could not be verified.");
 		} else {
 			rv = status_code;
@@ -126,8 +153,9 @@ static int oauth2_request_handler(oauth2_cfg_source_token_t *cfg,
 
 	if (oauth2_apache_set_request_user(target_pass, ctx, json_token) ==
 	    false) {
-		rv = oauth2_apache_return_www_authenticate(
-		    cfg, ctx, HTTP_UNAUTHORIZED, OAUTH2_ERROR_INVALID_TOKEN,
+		rv = oauth2_set_www_authenticate(
+		    www_authenticate_header_string, cfg, ctx,
+		    HTTP_UNAUTHORIZED, OAUTH2_ERROR_INVALID_TOKEN,
 		    "Could not determine remote user.");
 		goto end;
 	}
@@ -185,13 +213,15 @@ static int oauth2_check_user_id_handler(request_rec *r)
 		     r->parsed_uri.path, r->args, ap_is_initial_req(r));
 
 	if (strcasecmp((const char *)ap_auth_type(r), OAUTH2_AUTH_TYPE) == 0)
-		return oauth2_request_handler(cfg->source_token, cfg->verify,
-					      cfg->target_pass, ctx, true);
+		return oauth2_request_handler(
+		    cfg->source_token, cfg->verify, cfg->target_pass,
+		    cfg->www_authenticate_header_string, ctx, true);
 
 	if (strcasecmp((const char *)ap_auth_type(r),
 		       OAUTH2_AUTH_TYPE_OPENIDC) == 0)
-		return oauth2_request_handler(cfg->source_token, cfg->verify,
-					      cfg->target_pass, ctx, false);
+		return oauth2_request_handler(
+		    cfg->source_token, cfg->verify, cfg->target_pass,
+		    cfg->www_authenticate_header_string, ctx, false);
 
 	return DECLINED;
 }
@@ -298,6 +328,15 @@ OAUTH2_APACHE_CMD_ARGS2(oauth2, oauth2_cfg_dir_t, accept_token_in,
 OAUTH2_APACHE_CMD_ARGS1(oauth2, oauth2_cfg_dir_t, target_pass,
 			oauth2_cfg_set_target_pass_options, cfg->target_pass)
 
+static const char *apache_oauth2_set_www_authenticate_header_string(
+    cmd_parms *cmd, void *m, const char *v1)
+{
+	oauth2_cfg_dir_t *cfg = (oauth2_cfg_dir_t *)m;
+	return oauth2_cfg_set_str_slot(
+	    cfg, offsetof(oauth2_cfg_dir_t, www_authenticate_header_string),
+	    v1);
+}
+
 // clang-format off
 
 static const command_rec OAUTH2_APACHE_COMMANDS(oauth2)[] = {
@@ -326,6 +365,11 @@ static const command_rec OAUTH2_APACHE_COMMANDS(oauth2)[] = {
 		"OAuth2Cache",
 		cache,
 		"Set cache backend and options."),
+
+	AP_INIT_TAKE1("OAuth2WwwAuthenticateHeaderString",
+		apache_oauth2_set_www_authenticate_header_string, NULL,
+		RSRC_CONF | ACCESS_CONF | OR_AUTHCFG,
+		"Set a custom WWW-Authenticate header string."),
 
 	{ NULL }
 };
